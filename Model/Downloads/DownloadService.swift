@@ -37,6 +37,84 @@ final class DownloadService: NSObject, URLSessionDelegate, URLSessionTaskDelegat
         operationQueue.underlyingQueue = queue
         return URLSession(configuration: configuration, delegate: self, delegateQueue: operationQueue)
     }()
+    
+    #if os(macOS)
+    /// Observer for direct-write download completion notifications
+    private var directWriteCompletionObserver: NSObjectProtocol?
+    #endif
+    
+    // MARK: - Initialization
+    
+    override init() {
+        super.init()
+
+        #if os(macOS)
+        // Set up observer for direct-write download completions
+        setupDirectWriteObserver()
+        // Eagerly initialize DirectWriteDownloadService to restore interrupted downloads
+        if DownloadDestination.shouldUseDirectWrite {
+            _ = DirectWriteDownloadService.shared
+        }
+        #endif
+    }
+    
+    #if os(macOS)
+    private func setupDirectWriteObserver() {
+        directWriteCompletionObserver = NotificationCenter.default.addObserver(
+            forName: .directWriteDownloadCompleted,
+            object: nil,
+            queue: .main
+        ) { [weak self] notification in
+            guard let userInfo = notification.userInfo,
+                  let zimFileID = userInfo["zimFileID"] as? UUID,
+                  let fileURL = userInfo["fileURL"] as? URL else {
+                return
+            }
+            self?.handleDirectWriteCompletion(zimFileID: zimFileID, fileURL: fileURL)
+        }
+    }
+    
+    /// Handles completion of a direct-write download
+    private func handleDirectWriteCompletion(zimFileID: UUID, fileURL: URL) {
+        Log.DownloadService.info(
+            "Direct-write download completed for \(zimFileID.uuidString, privacy: .public)"
+        )
+        
+        // Re-acquire security-scoped access if using custom directory
+        var needsSecurityScope = false
+        if let customDir = DownloadDestination.customDownloadDirectory() {
+            needsSecurityScope = customDir.startAccessingSecurityScopedResource()
+        }
+        
+        // Open the file using the existing infrastructure
+        Task { @ZimActor in
+            Log.DownloadService.info(
+                "Opening direct-write downloaded zimFile: \(zimFileID.uuidString, privacy: .public)"
+            )
+            await LibraryOperations.open(url: fileURL)
+            Log.DownloadService.info(
+                "Opened direct-write downloaded zimFile: \(zimFileID.uuidString, privacy: .public)"
+            )
+            
+            // Release security-scoped access
+            if needsSecurityScope {
+                fileURL.deletingLastPathComponent().stopAccessingSecurityScopedResource()
+            }
+            
+            // Schedule notification and clean up
+            scheduleDownloadCompleteNotification(zimFileID: zimFileID)
+            deleteDownloadTask(zimFileID: zimFileID)
+        }
+    }
+    #endif
+    
+    deinit {
+        #if os(macOS)
+        if let observer = directWriteCompletionObserver {
+            NotificationCenter.default.removeObserver(observer)
+        }
+        #endif
+    }
 
     // MARK: - Heartbeat
 
@@ -64,6 +142,62 @@ final class DownloadService: NSObject, URLSessionDelegate, URLSessionTaskDelegat
     ///   - allowsCellularAccess: if using cellular data is allowed
     @MainActor func start(zimFileID: UUID, allowsCellularAccess: Bool) {
         requestNotificationAuthorization()
+        
+        #if os(macOS)
+        // On macOS, check if we should use direct-write downloads
+        // (when a custom download directory is configured)
+        if DownloadDestination.shouldUseDirectWrite {
+            startDirectWriteDownload(zimFileID: zimFileID, allowsCellularAccess: allowsCellularAccess)
+            return
+        }
+        #endif
+        
+        // Standard background download (iOS always, macOS when using default directory)
+        startBackgroundDownload(zimFileID: zimFileID, allowsCellularAccess: allowsCellularAccess)
+    }
+    
+    #if os(macOS)
+    /// Starts a direct-write download on macOS (writes directly to custom directory)
+    @MainActor private func startDirectWriteDownload(zimFileID: UUID, allowsCellularAccess: Bool) {
+        Database.shared.performBackgroundTask { context in
+            context.mergePolicy = NSMergePolicy.mergeByPropertyObjectTrump
+            let fetchRequest = ZimFile.fetchRequest(fileID: zimFileID)
+            guard let zimFile = try? context.fetch(fetchRequest).first,
+                  var url = zimFile.downloadURL else {
+                return
+            }
+            
+            // Create download task entry in database
+            let downloadTask = DownloadTask(context: context)
+            downloadTask.created = Date()
+            downloadTask.fileID = zimFileID
+            downloadTask.zimFile = zimFile
+            Task { @MainActor [weak context] in
+                try? context?.save()
+            }
+            
+            // Clean up URL (remove .meta4 extension if present)
+            if url.lastPathComponent.hasSuffix(".meta4") {
+                url = url.deletingPathExtension()
+            }
+            
+            let expectedSize = zimFile.size
+            
+            // Start direct-write download
+            Task { @MainActor in
+                await DirectWriteDownloadService.shared.start(
+                    zimFileID: zimFileID,
+                    downloadURL: url,
+                    expectedSize: expectedSize,
+                    allowsCellularAccess: allowsCellularAccess
+                )
+            }
+        }
+    }
+    #endif
+    
+    /// Starts a standard background download (uses system temp directory)
+    @MainActor private func startBackgroundDownload(zimFileID: UUID, allowsCellularAccess: Bool) {
         Database.shared.performBackgroundTask { [self] context in
             context.mergePolicy = NSMergePolicy.mergeByPropertyObjectTrump
             let fetchRequest = ZimFile.fetchRequest(fileID: zimFileID)
@@ -137,17 +271,55 @@ final class DownloadService: NSObject, URLSessionDelegate, URLSessionTaskDelegat
     /// Cancel a zim file download task
     /// - Parameter zimFileID: identifier of the zim file
     func cancel(zimFileID: UUID) {
+        #if os(macOS)
+        Task { @MainActor in
+            // Check if this is a direct-write download
+            if DirectWriteDownloadService.shared.activeDownloads[zimFileID] != nil {
+                DirectWriteDownloadService.shared.cancel(zimFileID: zimFileID)
+                self.deleteDownloadTask(zimFileID: zimFileID)
+            } else {
+                // Standard background download cancellation
+                self.session.getTasksWithCompletionHandler { _, _, downloadTasks in
+                    if let task = downloadTasks.filter({ $0.taskDescription == zimFileID.uuidString }).first {
+                        task.cancel()
+                    }
+                    self.deleteDownloadTask(zimFileID: zimFileID)
+                }
+            }
+        }
+        #else
+        // Standard background download cancellation
         session.getTasksWithCompletionHandler { _, _, downloadTasks in
             if let task = downloadTasks.filter({ $0.taskDescription == zimFileID.uuidString }).first {
                 task.cancel()
             }
             self.deleteDownloadTask(zimFileID: zimFileID)
         }
+        #endif
     }
 
     /// Pause a zim file download task
     /// - Parameter zimFileID: identifier of the zim file
     func pause(zimFileID: UUID) {
+        #if os(macOS)
+        Task { @MainActor in
+            // Check if this is a direct-write download
+            if DirectWriteDownloadService.shared.activeDownloads[zimFileID] != nil {
+                DirectWriteDownloadService.shared.pause(zimFileID: zimFileID)
+            } else {
+                // Standard background download pause
+                self.session.getTasksWithCompletionHandler { [weak self] _, _, downloadTasks in
+                    guard let task = downloadTasks.filter({ $0.taskDescription == zimFileID.uuidString }).first else { return }
+                    task.cancel { resumeData in
+                        Task { @MainActor in
+                            self?.progress.updateFor(uuid: zimFileID, withResumeData: resumeData)
+                        }
+                    }
+                }
+            }
+        }
+        #else
+        // Standard background download pause
         session.getTasksWithCompletionHandler { [progress] _, _, downloadTasks in
             guard let task = downloadTasks.filter({ $0.taskDescription == zimFileID.uuidString }).first else { return }
             task.cancel { [progress] resumeData in
@@ -156,13 +328,25 @@ final class DownloadService: NSObject, URLSessionDelegate, URLSessionTaskDelegat
                 }
             }
         }
+        #endif
     }
 
     /// Resume a zim file download task and start heartbeat
     /// - Parameter zimFileID: identifier of the zim file
     @MainActor func resume(zimFileID: UUID) {
         requestNotificationAuthorization()
+        
+        #if os(macOS)
+        // Check if this is a direct-write download
+        if DirectWriteDownloadService.shared.activeDownloads[zimFileID] != nil {
+            Task {
+                await DirectWriteDownloadService.shared.resume(zimFileID: zimFileID)
+            }
+            return
+        }
+        #endif
 
+        // Standard background download resume
         guard let resumeData = progress.resumeDataFor(uuid: zimFileID) else { return }
         progress.updateFor(uuid: zimFileID, withResumeData: nil)
 

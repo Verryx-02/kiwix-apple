@@ -279,15 +279,15 @@ enum Diagnostics {
     }
     
     private static func freeSpace() -> String {
-        
-        let freeSpace: Int64? = try? FileManager.default
-            .urls(for: .documentDirectory, in: .userDomainMask)
-            .first?.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey])
+        #if os(macOS)
+        let freeSpace = DownloadDestination.availableDiskSpace()
+        #else
+        let directory = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first
+        let freeSpace: Int64? = try? directory?.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey])
             .volumeAvailableCapacityForImportantUsage
-        
-        guard let freeSpace else {
-            return "unknown"
-        }
+        #endif
+
+        guard let freeSpace else { return "unknown" }
         return byteCountFormatter.string(fromByteCount: freeSpace)
     }
 }
